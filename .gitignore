@@ -1,0 +1,6 @@
+.stack-work/
+*~
+*.bc
+*.o
+*.s
+*.out
