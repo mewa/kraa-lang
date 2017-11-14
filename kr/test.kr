@@ -1,1 +1,5 @@
-(setq main ((b a) (* 1 b)))
+(setq main (+ 1
+      ((b a) (+ b a)) 1 2))
+
+(setq invalid ((d) (d d)))
+
