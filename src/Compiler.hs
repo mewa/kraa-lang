@@ -36,6 +36,9 @@ data IRExpr = IRExpr {
 data ExprType = Unit | Int | String | Ptr | Morph [ExprType] | Any
   deriving (Show, Eq)
 
+isAnyType Any = True
+isAnyType _ = False
+
 arity :: ExprType -> Int
 arity (Morph t) = max 0 $ length t - 1
 arity _ = 0
@@ -69,6 +72,7 @@ typeCheck e@(Val (Symbol s)) = do
     Just (IR (IRExpr _ _ _ t)) -> pure $ TypedExpr e t
 typeCheck e@(Val (Num n)) = pure $ TypedExpr e Int
 typeCheck e@(Val (Str s)) = pure $ TypedExpr e String
+-- TODO: add closure type inference
 typeCheck e@(Lambda n (CompiledSExpr args) body) = do
   s <- get
   let stateWithArgs = s { symbols = Prelude.foldl addArgs (symbols s) args }
@@ -115,23 +119,28 @@ foldTypedExprs (stType, st) e@(TypedExpr ex t) = do
     False -> return $ (Unit, e : st)
     True -> do
       let (Morph types) = t
-          (matching, newTypes) = matchTypes types newExprs
+          (matching, inferredTypes) = matchTypes types newExprs
           newType = case drop maxAr types of
                       t@(x:y:z) -> Morph t
                       [t] -> t
           newExprs = take maxAr st
-
       if matching then do
-        inferredNewExprs <- fmap (e :) $ zipWithM inferSymbols (fmap snd newTypes) newExprs
+        let newTypes = fmap inferIfNotAny inferredTypes
+              where
+                inferIfNotAny (old, new)
+                  | isAnyType new = old
+                  | otherwise = new
+        inferredNewExprs <- fmap (e :) $ zipWithM inferSymbols newTypes newExprs
         return $ (newType, inferredNewExprs ++ (drop maxAr st))
         else
-        throwError $ "type err: " ++ show e ++ "\n" ++ show (types, newTypes) ++ "\n" ++ show st
+        throwError $ "type err: " ++ show e ++ "\n" ++ show (types, inferredTypes) ++ "\n" ++ show st
 foldTypedExprs (t, st) e = let t = boundType e
                            in return $ (t, e : st)
 
+-- Tries to match types from Morph with types from TypedExpression
 matchTypes :: [ExprType] -> [TypedExpr] -> (Bool, [(ExprType, ExprType)])
 matchTypes types exprs = let
-  match = Prelude.foldl (\acc (a, b) -> acc && a == b) True matchedTypes
+  match = Prelude.foldl (\acc (a, b) -> acc && (isAnyType a || isAnyType b || a == b)) True matchedTypes
   matchedTypes = zipWith matchType types exprs
   in (match, matchedTypes)
     where
@@ -143,7 +152,7 @@ inferSymbols :: ExprType -> TypedExpr ->
 inferSymbols t (InferredExpr e@(Val (Symbol sym))) = do
   state <- get
   let newExpr = TypedExpr e t
-  put $ state { symbols = insert sym (TypeChecked newExpr) (symbols state) }
+  when (not . isAnyType $ t) $ put $ state { symbols = insert sym (TypeChecked newExpr) (symbols state) }
   pure newExpr
 inferSymbols _ e = pure e
 
@@ -230,7 +239,7 @@ checkSym sym = do
   else
     return ()
 
-compileFile :: IO () -- (Either String [[TypedExpr]])
+compileFile :: IO (Either String ([[TypedExpr]], KState))
 compileFile = do
   f <- parseFile
   let typed = runIdentity . runExceptT $ flip runStateT initialK $ do
@@ -238,9 +247,7 @@ compileFile = do
         sexprs <- mapM (toExceptT) $ fmap sexpr parsed
         compiled <- compileTopLevel sexprs
         mapM (mapM typeCheck) compiled
-  case typed of
-    Left err -> putStrLn err
-    Right exprs -> print exprs
+  return typed
 
 sexpr :: Expr -> S.StateT KState (Either String) SExpr
 sexpr (Ui32Lit n) = pure . Atom . Num $  n
