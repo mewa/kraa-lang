@@ -33,7 +33,7 @@ data IRExpr = IRExpr {
   , exprType :: ExprType
   } deriving (Show)
 
-data ExprType = Unit | Int | String | Ptr | Morph [ExprType]
+data ExprType = Unit | Int | String | Ptr | Morph [ExprType] | Any
   deriving (Show, Eq)
 
 arity :: ExprType -> Int
@@ -43,9 +43,9 @@ arity _ = 0
 data TypedExpr = TypedExpr Compiled ExprType | InferredExpr Compiled | TypedExprList [TypedExpr] ExprType
   deriving (Show)
 
-boundExpr (InferredExpr _) = Nothing
-boundExpr e = Just $ boundType e
 
+
+boundType (InferredExpr _) = Any
 boundType (TypedExpr _ t) = t
 boundType (TypedExprList _ t) = t
 
@@ -74,10 +74,24 @@ typeCheck e@(Lambda n (CompiledSExpr args) body) = do
   let stateWithArgs = s { symbols = Prelude.foldl addArgs (symbols s) args }
         where
           addArgs map e@(Val (Symbol arg)) = Map.insert arg (TypeChecked (InferredExpr e)) map
-  types <- withLocalStateT (const stateWithArgs) $ mapM typeCheck body
-  let (TypedExprList _ t) = last types
-  return $ TypedExpr e t
-typeCheck e@(Def name expr) = typeCheck expr
+  (typedArgs, types) <- withLocalStateT (const stateWithArgs) $ do
+    types <- mapM typeCheck body
+    types <- reduceTypedExprs types
+    sym <- gets symbols
+    let typedArgs = Prelude.foldr getArgs [] args
+          where
+            getArgs e@(Val (Symbol arg)) args = let
+              (Just (TypeChecked tc)) = Map.lookup arg sym
+              t = boundType tc
+              in t : args
+    return $ (typedArgs, types)
+  let retType = boundType types
+  return $ TypedExpr e $ Morph $ typedArgs ++ retType : []
+typeCheck e@(Def name expr) = do
+  t <- typeCheck expr
+  s <- get
+  put $ s { symbols = Map.insert name (TypeChecked t) (symbols s) }
+  return $ t
 typeCheck e@(CompiledSExpr exprs) = do
   texprs <- sequence $ fmap typeCheck exprs
   reduceTypedExprs texprs
@@ -85,31 +99,35 @@ typeCheck e@(CompiledSExpr exprs) = do
 reduceTypedExprs :: [TypedExpr] ->
   StateT KState (ExceptT String Identity) TypedExpr
 reduceTypedExprs exprs = do
-  (exprType, exprs) <- foldM foldTypedExprs (Unit, []) (reverse exprs)
-  return $ TypedExprList exprs exprType
+  (exprType, texprs) <- foldM foldTypedExprs (Any, []) (reverse exprs)
+  return $ if length texprs == 1 then
+             head texprs
+           else
+             TypedExprList texprs exprType
 
 foldTypedExprs :: (ExprType, [TypedExpr]) -> TypedExpr ->
   StateT KState (ExceptT String Identity) (ExprType, [TypedExpr])
-foldTypedExprs (stTypes, st) e@(TypedExpr ex t) = do
+foldTypedExprs (stType, st) e@(TypedExpr ex t) = do
   let ar = arity t
       stlen = length st
       maxAr = if ar > stlen then stlen else ar
   case ar > 0 of
     False -> return $ (Unit, e : st)
     True -> do
-      let exprList = e : newExprs
-          (Morph types) = t
+      let (Morph types) = t
           (matching, newTypes) = matchTypes types newExprs
           newType = case drop maxAr types of
                       t@(x:y:z) -> Morph t
                       [t] -> t
           newExprs = take maxAr st
 
-      if matching then
-        return $ (newType, exprList ++ (drop maxAr st))
+      if matching then do
+        inferredNewExprs <- fmap (e :) $ zipWithM inferSymbols (fmap snd newTypes) newExprs
+        return $ (newType, inferredNewExprs ++ (drop maxAr st))
         else
-        throwError $ "type err: " ++ show (types, newTypes) ++ "\n" ++ show st
-foldTypedExprs (t, st) e = return $ (Unit, e : st)
+        throwError $ "type err: " ++ show e ++ "\n" ++ show (types, newTypes) ++ "\n" ++ show st
+foldTypedExprs (t, st) e = let t = boundType e
+                           in return $ (t, e : st)
 
 matchTypes :: [ExprType] -> [TypedExpr] -> (Bool, [(ExprType, ExprType)])
 matchTypes types exprs = let
@@ -118,9 +136,16 @@ matchTypes types exprs = let
   in (match, matchedTypes)
     where
       matchType :: ExprType -> TypedExpr -> (ExprType, ExprType)
-      matchType t e = case boundExpr e of
-        Just et -> (t, et)
-        Nothing -> (t, t)
+      matchType t e = (t, boundType e)
+
+inferSymbols :: ExprType -> TypedExpr ->
+  StateT KState (ExceptT String Identity) TypedExpr
+inferSymbols t (InferredExpr e@(Val (Symbol sym))) = do
+  state <- get
+  let newExpr = TypedExpr e t
+  put $ state { symbols = insert sym (TypeChecked newExpr) (symbols state) }
+  pure newExpr
+inferSymbols _ e = pure e
 
 initialK = let map = insert "+" (IR irAdd) Map.empty
   in KState map 0
@@ -185,8 +210,11 @@ compile e@(Atom a@(Num _)) = do
 compile e@(Atom a@(Str _)) = do
   return . return $ Val a
 compile e@(SExpr [(Atom (Symbol "setq")), ((Atom (Symbol name))), r]) = do
-  body <- compile r
-  return . return $ Def name $ CompiledSExpr body
+  body <- fmap makeDef $ compile r
+  return . return $ Def name body
+    where
+      makeDef e@(a:b:_) = CompiledSExpr e
+      makeDef [e] = e
 compile e@(SExpr s) = do
   b <- fmap concat $ sequence $ fmap compile s
   return . return $ CompiledSExpr b
@@ -205,7 +233,7 @@ checkSym sym = do
 compileFile :: IO () -- (Either String [[TypedExpr]])
 compileFile = do
   f <- parseFile
-  let typed = runIdentity . runExceptT $ flip evalStateT initialK $ do
+  let typed = runIdentity . runExceptT $ flip runStateT initialK $ do
         parsed <- lift . ExceptT $ return $  getSymbols f
         sexprs <- mapM (toExceptT) $ fmap sexpr parsed
         compiled <- compileTopLevel sexprs
